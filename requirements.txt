@@ -1,4 +1,4 @@
-requests>=2.32
-pandas>=2.0
-numpy>=1.26
-pyarrow>=14.0
+requests==2.32.5
+pandas==2.3.3
+numpy==2.4.1
+pyarrow==22.0.0
