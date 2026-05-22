@@ -1,0 +1,14 @@
+# Data cache — never commit
+src/cache_parquet/
+
+# Claude Code local settings
+.claude/
+
+# Python artifacts
+__pycache__/
+*.egg-info/
+*.pyc
+.eggs/
+
+# Local environment
+.env
