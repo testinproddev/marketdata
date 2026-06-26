@@ -3,15 +3,16 @@ name = "marketdata"
 version = "0.1.0"
 description = "Shared market data fetching library (CoinGecko + Binance)"
 requires-python = ">=3.11"
-
-[project.urls]
-Repository = "https://github.com/testinproddev/marketdata"
 dependencies = [
     "requests>=2.31",
     "pandas>=2.0",
     "numpy>=1.26",
     "pyarrow>=14.0",
+    "yfinance>=0.2",
 ]
+
+[project.urls]
+Repository = "https://github.com/testinproddev/marketdata"
 
 [project.optional-dependencies]
 dev = [
