@@ -7,8 +7,17 @@ src/cache_parquet/
 # Python artifacts
 __pycache__/
 *.egg-info/
-*.pyc
 .eggs/
+dist/
+build/
+
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environment
+.venv/
 
 # Local environment
 .env

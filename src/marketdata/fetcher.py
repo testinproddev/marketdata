@@ -1,156 +1,160 @@
 # marketdata/fetcher.py
 """
-DataFetcher — orchestrates DataStore, SourceResolver, and adapters.
+Fetcher — universal fetch-and-cache orchestrator.
 
-get(coins, start, end) is the single public entry point:
-  1. Resolve the preferred source per coin (Binance or CoinGecko)
-  2. Ask the store which windows are missing
-  3. Call the adapter only for missing windows
-  4. Merge new data with existing cache and persist
-  5. Return the requested [start, end] slice for every coin
+fetch(asset_ids, data_type, start, end) is the single public entry point:
+  1. Build a resolution plan via the registry (asset_id → SourceRegistration + symbol)
+  2. For each resolved asset, ask the store which windows are missing
+  3. Call the adapter only for missing windows (_fill_gaps)
+  4. Return the requested [start, end] slice for every asset that has data
+
+All source-selection and symbol-resolution logic lives in SourceRegistry.
+All caching logic lives in DataStore.
+This class orchestrates; it contains no source-specific knowledge.
 """
 
+from __future__ import annotations
+
+import logging
+
 import pandas as pd
-import requests
 
-from marketdata.fetch_config import Config
+from marketdata.data_types import DataType, GapStrategy
+from marketdata.fetch_config import _to_utc
+from marketdata.registry import SourceRegistration, SourceRegistry
 from marketdata.store import DataStore
-from marketdata.resolver import SourceResolver
-from marketdata.adapters import BinanceAdapter, CoinGeckoAdapter
-from marketdata.coin_registry import load as load_symbols
+
+log = logging.getLogger(__name__)
 
 
-def _to_utc(dt) -> pd.Timestamp:
-    ts = pd.Timestamp(dt)
-    return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
-
-
-class DataFetcher:
+class Fetcher:
     """
-    Fetch and cache hourly OHLCV data for a list of CoinGecko coin dicts.
+    Fetch and cache market data for a list of asset ids.
 
     Parameters
     ----------
-    store     : DataStore — parquet cache + manifest
-    resolver  : SourceResolver — per-coin source selection
-    binance   : BinanceAdapter — Binance HTTP adapter
-    coingecko : CoinGeckoAdapter — CoinGecko HTTP adapter
+    store    : DataStore — parquet cache + SQLite manifest
+    registry : SourceRegistry — source registrations and resolution plan builder
     """
 
-    def __init__(
-        self,
-        store:     DataStore,
-        resolver:  SourceResolver,
-        binance:   BinanceAdapter,
-        coingecko: CoinGeckoAdapter,
-    ) -> None:
-        self._store     = store
-        self._resolver  = resolver
-        self._binance   = binance
-        self._coingecko = coingecko
+    def __init__(self, store: DataStore, registry: SourceRegistry) -> None:
+        self._store    = store
+        self._registry = registry
+        # Resolution actually used by the most recent fetch() call, as
+        # asset_id → {"provider", "symbol", "data_type"}. Recorded rather than
+        # re-derived so callers persist what produced the data, not what a
+        # second resolution would pick today (registry priorities change).
+        self.last_provenance: dict[str, dict[str, str]] = {}
 
-    def get(
+    def fetch(
         self,
-        coins: list[str],
+        asset_ids: list[str],
+        data_type: DataType,
         start,
         end,
     ) -> dict[str, pd.DataFrame]:
         """
-        Return aligned hourly DataFrames for [start, end].
+        Return DataFrames for [start, end] for all resolvable assets.
 
-        Only fetches data not already covered by the cache manifest.
-        Coins with no data from either source are excluded from the result.
+        Only fetches windows not already covered by the cache manifest.
+        Assets with no registered source for data_type are excluded from result.
 
         Parameters
         ----------
-        coins : list of CoinGecko coin_ids (e.g. ['bitcoin', 'ethereum'])
-        start : any datetime-like
-        end   : any datetime-like
+        asset_ids : list of asset / coin ids
+        data_type : which data type to fetch
+        start     : any datetime-like
+        end       : any datetime-like
 
         Returns
         -------
-        dict[coin_id -> DataFrame with at least 'close', UTC DatetimeIndex]
+        dict[asset_id → DataFrame with UTC DatetimeIndex]
         """
-        load_symbols(coins)
         start_ts = _to_utc(start)
         end_ts   = _to_utc(end)
-        result: dict[str, pd.DataFrame] = {}
-        n = len(coins)
+        plan     = self._registry.build_plan(asset_ids, data_type)
+        n        = len(plan)
+        result:  dict[str, pd.DataFrame] = {}
+        self.last_provenance = {}
 
-        for i, coin_id in enumerate(coins, 1):
-            source = self._resolver.resolve(coin_id)
-            gaps   = self._store.find_gaps(coin_id, source, start_ts, end_ts)
-
+        for i, (asset_id, resolved) in enumerate(plan.items(), 1):
+            reg  = resolved.registration
+            gaps = self._store.find_gaps(asset_id, data_type, reg.provider, start_ts, end_ts)
             status = (
-                f"cache hit [{source}]"
+                f"cache hit [{reg.provider}.{data_type}]"
                 if not gaps
-                else f"{len(gaps)} gap(s) to fetch [{source}]"
+                else f"{len(gaps)} gap(s) [{reg.provider}.{data_type}]"
             )
-            print(f"[{i:>3}/{n}]  {coin_id:<40}  {status}")
+            log.debug("[%3d/%d]  %-44s  %s", i, n, asset_id, status)
 
             if gaps:
-                adapter = self._binance if source == "binance" else self._coingecko
-                self._fill_gaps(coin_id, source, adapter, gaps)
+                _fill_gaps(self._store, reg, resolved.symbol, asset_id, gaps)
 
-            cached = self._store.load(coin_id)
+            cached = self._store.load(asset_id, data_type, reg.provider)
             if cached is not None and not cached.empty:
-                result[coin_id] = cached.loc[start_ts:end_ts]
+                sliced = cached.loc[start_ts:end_ts]
+                if not sliced.empty:
+                    result[asset_id] = sliced
+                    # Only assets that actually yielded data — provenance must
+                    # describe the returned series, not the attempted plan.
+                    self.last_provenance[asset_id] = {
+                        "provider":  str(reg.provider),
+                        "symbol":    resolved.symbol,
+                        "data_type": str(data_type),
+                    }
 
-        print(f"\n✅  Data ready for {len(result)} / {n} coins")
+        log.info("%s data ready for %d / %d assets", data_type, len(result), len(asset_ids))
         return result
 
-    # ── Internal ──────────────────────────────────────────────────────────────
 
-    def _fill_gaps(
-        self,
-        coin_id: str,
-        source:  str,
-        adapter: BinanceAdapter | CoinGeckoAdapter,
-        gaps:    list[tuple[pd.Timestamp, pd.Timestamp]],
-    ) -> None:
-        cached     = self._store.load(coin_id)
-        new_chunks: list[pd.DataFrame] = []
+def _fill_gaps(
+    store:    DataStore,
+    reg:      SourceRegistration,
+    symbol:   str,
+    asset_id: str,
+    gaps:     list[tuple[pd.Timestamp, pd.Timestamp]],
+) -> None:
+    """Fetch each gap window, merge with cached data, and persist.
 
-        for gs, ge in gaps:
-            if source == "coingecko" and Config.CG_PLAN != "pro":
-                cutoff = ge - pd.Timedelta(days=89)
-                if gs < cutoff:
-                    # Old portion exceeds demo-tier hourly limit (>89 days).
-                    # Stamp it as fetched so it is not retried on every run.
-                    self._store.record_fetched(coin_id, source, gs, cutoff)
-                    gs = cutoff
-                # Fall through to fetch the recent ≤89-day tail.
+    Per-gap errors are caught and printed; other gaps and other assets continue.
+    Gaps are recorded in the manifest even on empty response (pre-listing windows).
+    """
+    cached      = store.load(asset_id, reg.data_type, reg.provider)
+    new_chunks: list[pd.DataFrame] = []
 
-            try:
-                chunk = adapter.fetch(coin_id, gs, ge)
-            except requests.exceptions.HTTPError as exc:
-                print(f"          ❌  {coin_id} [{source}] {gs.date()}–{ge.date()}: {exc}")
-                continue  # leave gap open — transient or auth error, retry next run
-            except Exception as exc:
-                print(f"          ❌  {coin_id} [{source}] {gs.date()}–{ge.date()}: {exc}")
-                continue  # leave gap open
+    for gs, ge in gaps:
+        try:
+            chunk = reg.adapter.fetch(symbol, gs, ge)
+        except Exception as exc:
+            log.warning(
+                "%s [%s.%s] %s-%s: %s",
+                asset_id, reg.provider, reg.data_type, gs.date(), ge.date(), exc,
+            )
+            continue  # leave gap open — retry on next run
 
-            if not chunk.empty:
-                new_chunks.append(chunk)
-                # Record only up to the last bar actually returned so that
-                # the tail gap is re-fetched on the next run (active coin lag).
-                self._store.record_fetched(coin_id, source, gs, chunk.index.max())
-            else:
-                # No data returned: coin not yet listed for this period.
-                # Mark the full requested window to avoid infinite retries.
-                self._store.record_fetched(coin_id, source, gs, ge)
+        if reg.columns is not None and not chunk.empty:
+            chunk = chunk[reg.columns]
+        if not chunk.empty:
+            new_chunks.append(chunk)
 
-        if not new_chunks:
-            return
+        # Record on success or empty response (pre-listing: marks window as checked).
+        record_end = (
+            chunk.index.max()
+            if reg.strategy == GapStrategy.EXACT_RETURNED and not chunk.empty
+            else ge
+        )
+        store.record_fetched(asset_id, reg.data_type, reg.provider, gs, record_end)
 
-        new_data = pd.concat(new_chunks)
-        new_data = new_data[~new_data.index.duplicated(keep="last")]
+    if not new_chunks:
+        return
 
-        if cached is not None and not cached.empty:
-            merged = pd.concat([cached, new_data])
-            # new_data appended last → wins on timestamp collisions
-            merged = merged[~merged.index.duplicated(keep="last")].sort_index()
-        else:
-            merged = new_data.sort_index()
+    new_data = pd.concat(new_chunks)
+    new_data = new_data[~new_data.index.duplicated(keep="last")]
 
-        self._store.save(coin_id, merged)
+    if cached is not None and not cached.empty:
+        merged = pd.concat([cached, new_data])
+        merged = merged[~merged.index.duplicated(keep="last")].sort_index()
+    else:
+        merged = new_data.sort_index()
+
+    store.save(asset_id, reg.data_type, reg.provider, merged)

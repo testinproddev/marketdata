@@ -1,6 +1,16 @@
 from pathlib import Path
+import logging
 import os
 import requests
+
+import pandas as pd
+
+log = logging.getLogger(__name__)
+
+
+def _to_utc(dt) -> pd.Timestamp:
+    ts = pd.Timestamp(dt)
+    return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
 
 # ── Exchange symbol overrides ─────────────────────────────────────────────────
 # COIN_ID_OVERRIDES: coin_id (CoinGecko ID) → exchange ticker.
@@ -10,6 +20,16 @@ COIN_ID_OVERRIDES: dict[str, dict[str, str]] = {
     "hyperliquid": {
         "tokamak-network": "TOKAMAK",   # CG symbol "ton" collides with the-open-network
         "saakuru-labs":    "SAAKURU",   # real HL SKR is seeker; saakuru has no HL perp
+        # 1000x (k-prefix) perps — HL API is case-sensitive; "kBONK" ≠ "KBONK".
+        # Must be in COIN_ID_OVERRIDES (not SYMBOL_OVERRIDES) to bypass the
+        # .upper() fallback in resolve_symbol and preserve the lowercase 'k'.
+        "bonk":       "kBONK",
+        "shiba-inu":  "kSHIB",
+        "pepe":       "kPEPE",
+        "floki":      "kFLOKI",
+        "neiro-3":    "kNEIRO",
+        "terra-luna": "kLUNC",
+        "dogs-2":     "kDOGS",
     },
     "binance": {
         "tokamak-network": "TOKAMAK",
@@ -57,16 +77,78 @@ def resolve_symbol(cg_symbol: str, exchange: str, coin_id: str = "") -> str:
     return SYMBOL_OVERRIDES.get(exchange, {}).get(sym, sym).upper()
 
 
+def _hl_post(payload: dict) -> list | dict:
+    r = requests.post(
+        Config.HL_API,
+        json=payload,
+        headers={"Content-Type": "application/json"},
+        timeout=60,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
 def _cg_get(path: str, params: dict) -> dict:
     """
-    Thin wrapper around requests.get for CoinGecko.
-    Free Demo keys are passed as a query-parameter (x_cg_demo_api_key).
+    Single entry point for all CoinGecko HTTP requests.
+
+    Retry policy (in order):
+      1. Sleep REQUEST_SLEEP before every call — keeps within ~30 req/min demo limit.
+      2. 429 rate limit      → retry twice with 30 s / 60 s backoff; if still
+                               429 after all keyed retries, try keyless (separate
+                               rate bucket — only when a key was sent).
+      3. 5xx server error    → retry once after 10 s (transient blip, not rate-limited).
+      4. 401/403 key rejected (only when a key was sent):
+           - error_code 10012 = data out of range for demo tier → raise immediately.
+           - other codes      → retry once without the key; /coins/list,
+             /market_chart/range, /market_chart are publicly accessible
+             for data within the past 365 days.
     """
-    params = dict(params)   # copy so caller's dict is not mutated
-    api_key = os.getenv("CG_API_KEY")
-    if api_key and api_key != "YOUR_DEMO_API_KEY_HERE":
+    import time
+    params   = dict(params)   # copy so caller's dict is not mutated
+    api_key  = os.getenv("CG_API_KEY")
+    key_sent = bool(api_key and api_key != "YOUR_DEMO_API_KEY_HERE")
+    if key_sent:
         params["x_cg_demo_api_key"] = api_key
-    r = requests.get(f"{Config.CG_API_BASE}{path}", params=params, timeout=60)
+
+    url = f"{Config.CG_API_BASE}{path}"
+    time.sleep(Config.REQUEST_SLEEP)
+
+    # ── 429 retry ─────────────────────────────────────────────────────────────
+    for wait in (30, 60):
+        r = requests.get(url, params=params, timeout=60)
+        if r.status_code == 429:
+            log.warning("429 rate limit — pausing %ds...", wait)
+            time.sleep(wait)
+            continue
+        break
+    else:
+        r = requests.get(url, params=params, timeout=60)
+        # Keyed rate limit exhausted — try keyless (separate rate bucket)
+        if r.status_code == 429 and key_sent:
+            log.warning("429 persists on keyed request — trying without key...")
+            keyless = {k: v for k, v in params.items() if k != "x_cg_demo_api_key"}
+            r = requests.get(url, params=keyless, timeout=60)
+
+    # ── 5xx retry (once, short wait) ──────────────────────────────────────────
+    if r.status_code >= 500:
+        log.warning("%d server error — retrying in 10s...", r.status_code)
+        time.sleep(10)
+        r = requests.get(url, params=params, timeout=60)
+
+    # ── 401/403 keyless retry ─────────────────────────────────────────────────
+    if r.status_code in (401, 403) and key_sent:
+        try:
+            err_code = r.json().get("error", {}).get("status", {}).get("error_code")
+        except Exception:
+            err_code = None
+        if err_code == 10012:
+            pass  # data out of range for demo tier — keyless won't help
+        else:
+            log.warning("CoinGecko: API key rejected — retrying without key...")
+            keyless = {k: v for k, v in params.items() if k != "x_cg_demo_api_key"}
+            r = requests.get(url, params=keyless, timeout=60)
+
     r.raise_for_status()
     return r.json()
 
@@ -178,7 +260,9 @@ class Config:
         "tradable-na-legal-receivables-ssl","circle-internet-group-ondo-tokenized-stock",
         "backed-cspx-core-s-p-500","intel-ondo-tokenized-stock",
         "spiko-digital-assets-cash-carry-fund-euro-share-class",
-        "na-capital-as-a-service-sstn","santos-fc-fan-token",
+        "na-capital-as-a-service-sstn","santos-fc-fan-token",'spacex-republic-pre-ipo',
+        "tradable-latam-bnpl-sstn","anemoy-tokenized-apollo-diversified-credit-fund",
+
         # ── crypto vault ──
         "main-street-yield","staked-frax-usd",
         "gauntlet-usd-alpha","compounding-open-dollar",

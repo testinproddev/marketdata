@@ -4,31 +4,41 @@ DataStore — unified parquet cache and SQLite fetch-window manifest.
 
 Responsibilities
 ----------------
-- Load/save per-coin parquet files (unified naming: {coin_id}.parquet)
-- Track which date windows have been fetched per (coin_id, source) pair
-- Expose find_gaps() so DataFetcher only requests missing data
-- One-time legacy migration: imports existing .fetched.json and
-  .ohlc.fetched.json files into the manifest on first access per coin,
-  so existing caches are not re-fetched after upgrade
+- Save/load per-asset parquet files: {asset_id}.{data_type}.{provider}.parquet
+- Track which date windows have been fetched per (asset_id, data_type, provider)
+- Expose find_gaps() so Fetcher only requests missing windows
+- Validate required columns on write (warn; always writes)
 
-The manifest (manifest.db) replaces N per-coin JSON files with a single
-SQLite table — one row per (coin_id, source), queryable in one statement.
+Manifest (manifest.db): one row per (asset_id, data_type, provider), storing
+a JSON list of covered [start, end] intervals.
 """
 
 import json
+import logging
+import os
 import sqlite3
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
+from marketdata.data_types import (
+    CANONICAL_DTYPES, DataType, DataProvider, REQUIRED_COLUMNS, TIMESTAMP_UNIT,
+)
+from marketdata.fetch_config import _to_utc
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+log = logging.getLogger(__name__)
 
-def _to_utc(dt) -> pd.Timestamp:
-    ts = pd.Timestamp(dt)
-    return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+# Bumped whenever CANONICAL_DTYPES / TIMESTAMP_UNIT / the write path changes
+# in a way that makes old files distinguishable from new ones. Stored in each
+# file's parquet key-value metadata so drift is detectable by reading the
+# footer instead of having to read+diff every file's schema by hand.
+SCHEMA_VERSION = 1
+_SCHEMA_VERSION_KEY = b"trading_system.schema_version"
 
 
 def _merge_windows(
@@ -81,17 +91,20 @@ def _windows_from_json(raw: str) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
 
 class DataStore:
     """
-    Parquet cache + SQLite manifest for hourly market data.
+    Parquet cache + SQLite manifest for market data.
+
+    File naming: {cache_dir}/{asset_id}.{data_type}.{provider}.parquet
+    Manifest:    {cache_dir}/manifest.db  PRIMARY KEY (asset_id, data_type, provider)
 
     Parameters
     ----------
-    cache_dir : Path
+    cache_dir : path-like
         Directory for parquet files and manifest.db. Created if absent.
     """
 
     _MANIFEST_DB = "manifest.db"
 
-    def __init__(self, cache_dir: Path):
+    def __init__(self, cache_dir) -> None:
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(
@@ -105,279 +118,241 @@ class DataStore:
     def _init_schema(self) -> None:
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS manifest (
-                coin_id          TEXT NOT NULL,
-                source           TEXT NOT NULL,
+                asset_id         TEXT NOT NULL,
+                data_type        TEXT NOT NULL,
+                provider         TEXT NOT NULL,
                 fetched_windows  TEXT NOT NULL DEFAULT '[]',
                 last_fetched_at  TEXT,
-                PRIMARY KEY (coin_id, source)
+                PRIMARY KEY (asset_id, data_type, provider)
             )
         """)
         self._conn.commit()
 
     # ── Parquet I/O ───────────────────────────────────────────────────────────
 
-    def load(self, coin_id: str) -> Optional[pd.DataFrame]:
+    def _path(self, asset_id: str, data_type: DataType, provider: DataProvider) -> Path:
+        return self.cache_dir / f"{asset_id}.{data_type}.{provider}.parquet"
+
+    def save(
+        self,
+        asset_id:  str,
+        data_type: DataType,
+        provider:  DataProvider,
+        df:        pd.DataFrame,
+    ) -> None:
+        """Persist df to {asset_id}.{data_type}.{provider}.parquet.
+
+        Warns if required columns for data_type are absent; writes regardless.
+        Columns not in CANONICAL_DTYPES[data_type] are dropped (stray/legacy
+        columns, e.g. an old CoinGecko "price" column alongside "close");
+        columns that are present are cast to their canonical dtype. The index
+        is normalized to UTC / TIMESTAMP_UNIT resolution so files of the same
+        (data_type, provider) share one physical schema instead of drifting
+        by whichever unit that particular fetch happened to return.
         """
-        Load cached DataFrame for coin_id. Returns None if absent.
+        required = REQUIRED_COLUMNS.get(data_type, [])
+        missing  = [c for c in required if c not in df.columns]
+        if missing:
+            warnings.warn(
+                f"save({asset_id!r}, {data_type}, {provider}): "
+                f"missing required columns {missing}",
+                stacklevel=2,
+            )
+        out = df.copy().sort_index()
+        out.index = (
+            out.index.tz_localize("UTC") if out.index.tz is None
+            else out.index.tz_convert("UTC")
+        ).as_unit(TIMESTAMP_UNIT)
 
-        Priority after migrate_parquet_data() has run:
-          {coin_id}.parquet always has a "close" column → returned directly.
+        canonical = CANONICAL_DTYPES.get(data_type, {})
+        unknown   = [c for c in out.columns if c not in canonical]
+        if unknown:
+            out = out.drop(columns=unknown)
+        for col, dtype in canonical.items():
+            if col in out.columns:
+                out[col] = out[col].astype(dtype)
 
-        Pre-migration fallback order (no merge — call migrate_parquet_data()
-        to get the merged result):
-          1. {coin_id}.parquet  with "close" column  → new unified format
-          2. {coin_id}.ohlc.parquet                  → Binance OHLC (takes
-             priority over legacy CG when both exist)
-          3. {coin_id}.parquet  with "price" column  → legacy CoinGecko only
+        table = pa.Table.from_pandas(out, preserve_index=True)
+        meta  = dict(table.schema.metadata or {})
+        meta[_SCHEMA_VERSION_KEY] = str(SCHEMA_VERSION).encode()
+        table = table.replace_schema_metadata(meta)
+
+        path = self._path(asset_id, data_type, provider)
+        tmp  = path.with_suffix(".parquet.tmp")
+        pq.write_table(
+            table,
+            tmp,
+            compression="zstd",
+            compression_level=9,
+            use_dictionary=False,
+            column_encoding={"time": "DELTA_BINARY_PACKED"} if out.index.name == "time" else None,
+        )
+        os.replace(tmp, path)  # atomic on both POSIX and Windows
+
+    def schema_version(
+        self, asset_id: str, data_type: DataType, provider: DataProvider,
+    ) -> Optional[int]:
+        """Return the schema version stamped in a cached file's metadata.
+
+        None if the file is absent or predates schema-version stamping.
         """
-        unified_path = self.cache_dir / f"{coin_id}.parquet"
-        ohlc_path    = self.cache_dir / f"{coin_id}.ohlc.parquet"
-
-        unified_df = self._load_parquet(unified_path) if unified_path.exists() else None
-        ohlc_df    = self._load_parquet(ohlc_path)    if ohlc_path.exists()    else None
-
-        # New unified format: "close" column present
-        if unified_df is not None and "close" in unified_df.columns:
-            return unified_df
-
-        # OHLC parquet takes priority over legacy CG parquet
-        if ohlc_df is not None:
-            return ohlc_df
-
-        # Legacy CG only: rename "price" → "close"
-        if unified_df is not None and "price" in unified_df.columns:
-            return unified_df.rename(columns={"price": "close"})
-
-        return None
-
-    def _load_parquet(self, path: Path) -> Optional[pd.DataFrame]:
-        """Load a parquet file with UTC index normalisation. No column renaming."""
-        try:
-            df = pd.read_parquet(path)
-        except Exception:
+        path = self._path(asset_id, data_type, provider)
+        if not path.exists():
             return None
-        idx = pd.DatetimeIndex(df.index)
-        df.index = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
-        return df
+        meta = pq.ParquetFile(path).schema_arrow.metadata or {}
+        raw  = meta.get(_SCHEMA_VERSION_KEY)
+        return int(raw) if raw is not None else None
 
-    def save(self, coin_id: str, df: pd.DataFrame) -> None:
-        """Persist DataFrame to {coin_id}.parquet with tz-aware UTC index."""
-        out = df.copy().sort_index()
-        out.index = (
-            out.index.tz_localize("UTC") if out.index.tz is None
-            else out.index.tz_convert("UTC")
+    def load(
+        self,
+        asset_id:  str,
+        data_type: DataType,
+        provider:  DataProvider,
+    ) -> Optional[pd.DataFrame]:
+        """Load cached DataFrame. Returns None if the file is absent.
+
+        A file that exists but fails to read (truncated write, corruption) is
+        logged loudly and also returns None — callers must not treat this the
+        same as "never fetched": pair with verify() to catch it in the manifest.
+        """
+        path = self._path(asset_id, data_type, provider)
+        if not path.exists():
+            return None
+        try:
+            df  = pd.read_parquet(path)
+            idx = pd.DatetimeIndex(df.index)
+            df.index = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
+            return df
+        except Exception:
+            log.error("corrupt/unreadable parquet file: %s", path, exc_info=True)
+            return None
+
+    def available(self, asset_id: str, data_type: DataType) -> list[DataProvider]:
+        """Return providers for which a cached file exists for (asset_id, data_type)."""
+        providers: list[DataProvider] = []
+        for p in self.cache_dir.glob(f"{asset_id}.{data_type}.*.parquet"):
+            parts = p.stem.split(".")
+            if len(parts) == 3:
+                try:
+                    providers.append(DataProvider(parts[2]))
+                except ValueError:
+                    pass
+        return providers
+
+    # ── Verification / reconciliation ────────────────────────────────────────
+
+    def verify(self, dry_run: bool = False) -> dict[str, list[tuple[str, str, str]]]:
+        """
+        Reconcile the manifest against the parquet files actually on disk.
+
+        Two drift directions occur in practice:
+          - phantom: manifest claims a window is fetched but the file is
+            missing or unreadable. fetch() sees find_gaps() == [] , skips
+            fetching, then load() returns None — the asset silently vanishes
+            from every future result. Fixed by deleting the manifest row so
+            the next fetch() re-requests the window.
+          - orphan: a valid parquet file exists with no manifest row. Every
+            fetch() treats it as never-fetched and re-downloads the full
+            window needlessly. Fixed by inserting a manifest row spanning
+            the file's actual [min, max] index.
+
+        Parameters
+        ----------
+        dry_run : if True, only report — make no changes.
+
+        Returns
+        -------
+        dict with 'phantom' and 'orphan' lists of (asset_id, data_type, provider).
+        """
+        rows = self._conn.execute(
+            "SELECT asset_id, data_type, provider FROM manifest"
+        ).fetchall()
+        manifest_keys = {(a, d, p) for a, d, p in rows}
+
+        phantom = [(a, d, p) for a, d, p in rows if self.load(a, d, p) is None]
+
+        orphan: list[tuple[str, str, str]] = []
+        for path in self.cache_dir.glob("*.parquet"):
+            parts = path.stem.split(".")
+            if len(parts) != 3:
+                continue
+            asset_id, data_type, provider = parts
+            if (asset_id, data_type, provider) in manifest_keys:
+                continue
+            try:
+                DataType(data_type)
+                DataProvider(provider)
+            except ValueError:
+                continue  # not a recognized {asset}.{data_type}.{provider}.parquet name
+            df = self.load(asset_id, data_type, provider)
+            if df is not None and not df.empty:
+                orphan.append((asset_id, data_type, provider))
+
+        if not dry_run:
+            for asset_id, data_type, provider in phantom:
+                self._conn.execute(
+                    "DELETE FROM manifest WHERE asset_id=? AND data_type=? AND provider=?",
+                    (asset_id, data_type, provider),
+                )
+            for asset_id, data_type, provider in orphan:
+                df = self.load(asset_id, data_type, provider)
+                self.record_fetched(asset_id, data_type, provider, df.index.min(), df.index.max())
+            self._conn.commit()
+
+        log.info(
+            "verify(): %d phantom manifest row(s), %d orphan file(s) — %s",
+            len(phantom), len(orphan), "dry run" if dry_run else "fixed",
         )
-        out.to_parquet(self.cache_dir / f"{coin_id}.parquet")
-
-    def load_funding(self, coin_id: str) -> Optional[pd.DataFrame]:
-        """Load cached funding DataFrame for coin_id. Returns None if absent."""
-        path = self.cache_dir / f"{coin_id}.funding.parquet"
-        return self._load_parquet(path) if path.exists() else None
-
-    def save_funding(self, coin_id: str, df: pd.DataFrame) -> None:
-        """Persist funding DataFrame to {coin_id}.funding.parquet."""
-        out = df.copy().sort_index()
-        out.index = (
-            out.index.tz_localize("UTC") if out.index.tz is None
-            else out.index.tz_convert("UTC")
-        )
-        out.to_parquet(self.cache_dir / f"{coin_id}.funding.parquet")
-
-    def load_marketcap(self, coin_id: str) -> Optional[pd.DataFrame]:
-        """Load cached market cap DataFrame for coin_id. Returns None if absent."""
-        path = self.cache_dir / f"{coin_id}.marketcap.parquet"
-        return self._load_parquet(path) if path.exists() else None
-
-    def save_marketcap(self, coin_id: str, df: pd.DataFrame) -> None:
-        """Persist market cap DataFrame to {coin_id}.marketcap.parquet."""
-        out = df.copy().sort_index()
-        out.index = (
-            out.index.tz_localize("UTC") if out.index.tz is None
-            else out.index.tz_convert("UTC")
-        )
-        out.to_parquet(self.cache_dir / f"{coin_id}.marketcap.parquet")
+        return {"phantom": phantom, "orphan": orphan}
 
     # ── Manifest ──────────────────────────────────────────────────────────────
 
-    def get_fetched_windows(
-        self, coin_id: str, source: str
+    def _get_fetched_windows(
+        self, asset_id: str, data_type: str, provider: str
     ) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
         row = self._conn.execute(
-            "SELECT fetched_windows FROM manifest WHERE coin_id=? AND source=?",
-            (coin_id, source),
+            "SELECT fetched_windows FROM manifest "
+            "WHERE asset_id=? AND data_type=? AND provider=?",
+            (asset_id, data_type, provider),
         ).fetchone()
-        if row is None:
-            self._migrate_legacy(coin_id, source)
-            row = self._conn.execute(
-                "SELECT fetched_windows FROM manifest WHERE coin_id=? AND source=?",
-                (coin_id, source),
-            ).fetchone()
         return _windows_from_json(row[0]) if row else []
 
     def record_fetched(
         self,
-        coin_id: str,
-        source: str,
-        start: pd.Timestamp,
-        end: pd.Timestamp,
+        asset_id:  str,
+        data_type: DataType,
+        provider:  DataProvider,
+        start:     pd.Timestamp,
+        end:       pd.Timestamp,
     ) -> None:
-        """Record a newly-fetched window, merging with existing ones."""
+        """Record a newly-fetched window, merging with existing covered intervals."""
         windows = _merge_windows(
-            self.get_fetched_windows(coin_id, source) + [(start, end)]
+            self._get_fetched_windows(asset_id, data_type, provider) + [(start, end)]
         )
         now = datetime.now(timezone.utc).isoformat()
         self._conn.execute(
             """
-            INSERT INTO manifest (coin_id, source, fetched_windows, last_fetched_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT (coin_id, source) DO UPDATE SET
+            INSERT INTO manifest (asset_id, data_type, provider, fetched_windows, last_fetched_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT (asset_id, data_type, provider) DO UPDATE SET
                 fetched_windows = excluded.fetched_windows,
                 last_fetched_at = excluded.last_fetched_at
             """,
-            (coin_id, source, _windows_to_json(windows), now),
+            (asset_id, str(data_type), str(provider), _windows_to_json(windows), now),
         )
         self._conn.commit()
 
     def find_gaps(
         self,
-        coin_id: str,
-        source: str,
-        start: pd.Timestamp,
-        end: pd.Timestamp,
+        asset_id:  str,
+        data_type: DataType,
+        provider:  DataProvider,
+        start:     pd.Timestamp,
+        end:       pd.Timestamp,
     ) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
         """Return sub-intervals of [start, end] not yet fetched for this source."""
-        return _compute_gaps(self.get_fetched_windows(coin_id, source), start, end)
-
-    # ── Parquet data migration ─────────────────���──────────────────────────────
-
-    def migrate_parquet_data(self) -> dict[str, int]:
-        """
-        One-time migration of legacy parquet files to the unified format.
-
-        Pass 1 — coins with {coin_id}.ohlc.parquet (Binance OHLC):
-          OHLC data saved as {coin_id}.parquet. CoinGecko prices are NOT
-          merged — one data source per coin.
-
-        Pass 2 — coins with only {coin_id}.parquet (CoinGecko "price" column):
-          "price" renamed to "close" and saved in place.
-
-        Idempotent: coins whose {coin_id}.parquet already has a "close"
-        column are skipped.
-
-        Returns
-        -------
-        dict with keys "ohlc", "cg_renamed", "skipped".
-        """
-        summary: dict[str, int] = {"ohlc": 0, "cg_renamed": 0, "skipped": 0}
-        ohlc_coin_ids: set[str] = set()
-
-        # Pass 1: coins with Binance OHLC parquet
-        for ohlc_path in sorted(self.cache_dir.glob("*.ohlc.parquet")):
-            coin_id = ohlc_path.name[: -len(".ohlc.parquet")]
-            ohlc_coin_ids.add(coin_id)
-
-            unified_path = self.cache_dir / f"{coin_id}.parquet"
-            if unified_path.exists():
-                existing = self._load_parquet(unified_path)
-                if existing is not None and "close" in existing.columns:
-                    summary["skipped"] += 1
-                    continue
-
-            ohlc_df = self._load_parquet(ohlc_path)
-            if ohlc_df is None:
-                continue
-
-            self.save(coin_id, ohlc_df)
-            summary["ohlc"] += 1
-            print(f"  [OHLC    ] {coin_id}")
-
-        # Pass 2: CoinGecko-only coins (no OHLC counterpart)
-        for cg_path in sorted(self.cache_dir.glob("*.parquet")):
-            if cg_path.name.endswith(".ohlc.parquet"):
-                continue
-            coin_id = cg_path.stem
-            if coin_id in ohlc_coin_ids:
-                continue  # handled in Pass 1
-
-            df = self._load_parquet(cg_path)
-            if df is None:
-                continue
-            if "close" in df.columns:
-                summary["skipped"] += 1
-                continue
-            if "price" in df.columns:
-                self.save(coin_id, df.rename(columns={"price": "close"}))
-                summary["cg_renamed"] += 1
-                print(f"  [CG only ] {coin_id}")
-
-        return summary
-
-    # ── Manifest / fetch-history migration ────────────────────────────────────
-
-    def migrate_all_legacy(self) -> dict[str, int]:
-        """
-        Eagerly import all legacy per-coin JSON fetch-history files found in
-        cache_dir into the manifest. Idempotent — already-migrated coins are
-        skipped via INSERT OR IGNORE.
-
-        Returns a summary dict: {"coingecko": n, "binance": n, "skipped": n}
-        where counts reflect files processed (not necessarily newly inserted).
-        """
-        summary = {"coingecko": 0, "binance": 0, "skipped": 0}
-
-        # CoinGecko: {coin_id}.fetched.json  (exclude *.ohlc.fetched.json)
-        for path in sorted(self.cache_dir.glob("*.fetched.json")):
-            if path.name.endswith(".ohlc.fetched.json"):
-                continue
-            coin_id = path.name[: -len(".fetched.json")]
-            migrated = self._migrate_legacy(coin_id, "coingecko")
-            if migrated:
-                summary["coingecko"] += 1
-                print(f"  [CoinGecko] {coin_id}")
-            else:
-                summary["skipped"] += 1
-
-        # Binance: {coin_id}.ohlc.fetched.json
-        for path in sorted(self.cache_dir.glob("*.ohlc.fetched.json")):
-            coin_id = path.name[: -len(".ohlc.fetched.json")]
-            migrated = self._migrate_legacy(coin_id, "binance")
-            if migrated:
-                summary["binance"] += 1
-                print(f"  [Binance  ] {coin_id}")
-            else:
-                summary["skipped"] += 1
-
-        return summary
-
-    def _migrate_legacy(self, coin_id: str, source: str) -> bool:
-        """
-        Import a legacy per-coin JSON fetch-history file into the manifest.
-
-        Returns True if a new row was inserted, False if the row already
-        existed or the legacy file was absent/empty.
-        """
-        legacy_name = (
-            f"{coin_id}.ohlc.fetched.json" if source == "binance"
-            else f"{coin_id}.fetched.json"
+        return _compute_gaps(
+            self._get_fetched_windows(asset_id, str(data_type), str(provider)),
+            start,
+            end,
         )
-        legacy_path = self.cache_dir / legacy_name
-        if not legacy_path.exists():
-            return False
-        try:
-            windows = _windows_from_json(legacy_path.read_text())
-        except Exception:
-            return False
-        if not windows:
-            return False
-        windows = _merge_windows(windows)
-        now = datetime.now(timezone.utc).isoformat()
-        cursor = self._conn.execute(
-            """
-            INSERT OR IGNORE INTO manifest
-                (coin_id, source, fetched_windows, last_fetched_at)
-            VALUES (?, ?, ?, ?)
-            """,
-            (coin_id, source, _windows_to_json(windows), now),
-        )
-        self._conn.commit()
-        return cursor.rowcount > 0
