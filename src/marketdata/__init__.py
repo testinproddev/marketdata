@@ -11,16 +11,25 @@ from marketdata.registry import DataSource, SourceRegistration, SourceRegistry
 from marketdata.fetcher import Fetcher
 from marketdata.store import DataStore
 from marketdata.binance_adapter import BinanceAdapter
-from marketdata.cg_adapter import CoinGeckoOHLCVAdapter, CoinGeckoMarketCapAdapter
+from marketdata.binance_futures_adapter import (
+    BinanceFundingAdapter, BinanceFuturesSymbolResolver,
+)
+from marketdata.binance_futures_ohlcv_adapter import BinanceFuturesOHLCVAdapter
+from marketdata.lighter_adapter import LighterFundingAdapter, LighterSymbolResolver
+from marketdata.cg_adapter import CoinGeckoOHLCVAdapter
 from marketdata.hl_adapter import HyperliquidCandleAdapter, HyperliquidFundingAdapter
 from marketdata.fetch_config import Config, resolve_symbol
-from marketdata.coin_registry import load as load_registry, symbol_of
-from marketdata.hl_registry import HyperliquidRegistry, HyperliquidSymbolResolver
-from marketdata.universe import (
-    get_coin_universe, hl_eligible, binance_eligible, get_hl_universe,
+from marketdata.hl_registry import HyperliquidSymbolResolver
+from marketdata.assets import (
+    Asset, AssetClass, AssetRegistry, find, make_asset_id, prefetch, registry,
+    resolve, resolver_for, split_asset_id, ticker_on,
+)
+from marketdata.hip3 import HIP3_DEXES, Hip3Dex, dex_of, provider_of, venue_of
+from marketdata.discovery import (
+    get_coin_universe, get_hl_universe,
 )
 try:
-    from marketdata.yf_registry import YFinanceRegistry
+    from marketdata.yf_registry import resolve_mic, resolve_yf_ticker
     from marketdata.yf_adapter import YFinanceAdapter
 except ImportError:
     pass  # yfinance is an optional dependency
@@ -36,20 +45,36 @@ __all__ = [
     "Fetcher",
     "DataStore",
     "BinanceAdapter",
+    "BinanceFundingAdapter",
+    "BinanceFuturesSymbolResolver",
+    "BinanceFuturesOHLCVAdapter",
+    "LighterFundingAdapter",
+    "LighterSymbolResolver",
     "CoinGeckoOHLCVAdapter",
-    "CoinGeckoMarketCapAdapter",
     "HyperliquidCandleAdapter",
     "HyperliquidFundingAdapter",
     "HyperliquidSymbolResolver",
-    "HyperliquidRegistry",
-    "YFinanceRegistry",
+    "Asset",
+    "AssetClass",
+    "AssetRegistry",
+    "resolve",
+    "find",
+    "prefetch",
+    "registry",
+    "resolver_for",
+    "ticker_on",
+    "split_asset_id",
+    "make_asset_id",
+    "HIP3_DEXES",
+    "Hip3Dex",
+    "dex_of",
+    "provider_of",
+    "venue_of",
+    "resolve_mic",
+    "resolve_yf_ticker",
     "YFinanceAdapter",
     "Config",
     "resolve_symbol",
-    "load_registry",
-    "symbol_of",
     "get_coin_universe",
     "get_hl_universe",
-    "hl_eligible",
-    "binance_eligible",
 ]

@@ -27,7 +27,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from marketdata.data_types import (
-    CANONICAL_DTYPES, DataType, DataProvider, REQUIRED_COLUMNS, TIMESTAMP_UNIT,
+    CANONICAL_DTYPES, DataType, DataProvider, OPTIONAL_COLUMNS, REQUIRED_COLUMNS,
+    TIMESTAMP_UNIT,
 )
 from marketdata.fetch_config import _to_utc
 
@@ -37,7 +38,7 @@ log = logging.getLogger(__name__)
 # in a way that makes old files distinguishable from new ones. Stored in each
 # file's parquet key-value metadata so drift is detectable by reading the
 # footer instead of having to read+diff every file's schema by hand.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2   # 2: DataType.FUNDING gained funding_interval_hours
 _SCHEMA_VERSION_KEY = b"trading_system.schema_version"
 
 
@@ -151,7 +152,8 @@ class DataStore:
         by whichever unit that particular fetch happened to return.
         """
         required = REQUIRED_COLUMNS.get(data_type, [])
-        missing  = [c for c in required if c not in df.columns]
+        exempt   = OPTIONAL_COLUMNS.get((data_type, provider), frozenset())
+        missing  = [c for c in required if c not in df.columns and c not in exempt]
         if missing:
             warnings.warn(
                 f"save({asset_id!r}, {data_type}, {provider}): "

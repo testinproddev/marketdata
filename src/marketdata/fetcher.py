@@ -118,9 +118,25 @@ def _fill_gaps(
 
     Per-gap errors are caught and printed; other gaps and other assets continue.
     Gaps are recorded in the manifest even on empty response (pre-listing windows).
+
+    A bar labelled T covers [T - interval, T) and is only complete once
+    real time has reached T. An adapter asked for data "up to now" will
+    generally hand back its currently-forming bar too — caching that as if
+    it were complete is a real corruption (a partial-bar's volume/close is
+    wrong and gets treated as final). So two things happen here, together:
+      1. any returned bar not yet closed is dropped before it is saved.
+      2. what gets RECORDED as covered never claims further than the last
+         closed bar either — for EXACT_RETURNED specifically, the recorded
+         end is that bar's OPEN time (label - interval), not its label,
+         because record_fetched's `end` becomes the next fetch's `start`,
+         and adapters take start/end as open times. Recording a close-time
+         label there made the very next fetch begin one bar too late,
+         permanently orphaning exactly the trailing bar (it would never
+         be reachable from any future `start` again).
     """
-    cached      = store.load(asset_id, reg.data_type, reg.provider)
+    cached           = store.load(asset_id, reg.data_type, reg.provider)
     new_chunks: list[pd.DataFrame] = []
+    complete_through = pd.Timestamp.now(tz="UTC").floor(reg.interval)
 
     for gs, ge in gaps:
         try:
@@ -135,15 +151,22 @@ def _fill_gaps(
         if reg.columns is not None and not chunk.empty:
             chunk = chunk[reg.columns]
         if not chunk.empty:
+            chunk = chunk[chunk.index <= complete_through]
+        if not chunk.empty:
             new_chunks.append(chunk)
 
-        # Record on success or empty response (pre-listing: marks window as checked).
-        record_end = (
-            chunk.index.max()
-            if reg.strategy == GapStrategy.EXACT_RETURNED and not chunk.empty
-            else ge
-        )
-        store.record_fetched(asset_id, reg.data_type, reg.provider, gs, record_end)
+        if reg.strategy == GapStrategy.EXACT_RETURNED and not chunk.empty:
+            record_end = chunk.index.max() - reg.interval
+            store.record_fetched(asset_id, reg.data_type, reg.provider, gs, record_end)
+        elif min(ge, complete_through) > gs:
+            # FULL_WINDOW, or an empty/all-forming response: record on success
+            # or empty response alike (pre-listing: marks window as checked) —
+            # but never past the last bar that has actually closed.
+            store.record_fetched(
+                asset_id, reg.data_type, reg.provider, gs, min(ge, complete_through)
+            )
+        # else: the whole gap is still in the future — nothing has closed yet,
+        # leave it open for a later run to pick up once it has.
 
     if not new_chunks:
         return

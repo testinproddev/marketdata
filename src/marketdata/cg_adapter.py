@@ -1,8 +1,8 @@
 # marketdata/cg_adapter.py
 """
-CoinGecko adapters — hourly OHLCV price history and daily market cap.
+CoinGecko OHLCV adapter — hourly close-only price history.
 
-Both adapters satisfy the DataSource protocol:
+Satisfies the DataSource protocol:
     fetch(coin_id, start, end) -> pd.DataFrame
 
 CoinGeckoOHLCVAdapter
@@ -10,18 +10,15 @@ CoinGeckoOHLCVAdapter
     Paginated in CG_CHUNK_DAYS windows. Timestamps rounded to the nearest
     hour — consistent with the Binance close_time convention.
 
-CoinGeckoMarketCapAdapter
-    Daily circulating market cap via /coins/{id}/market_chart?days=365.
-    One request per coin regardless of the requested date range; result is
-    sliced to [start, end]. Data older than 365 days is unavailable on the
-    free demo tier (forward-filled by downstream signals).
+A market-cap adapter lived here until 2026-09-10. CoinGecko's series proved
+unreliable and MARKETCAP was retired as a data type; market cap survives only
+as the /coins/markets ranking snapshot that universe.py pages through, which is
+a different thing and stays.
 """
 
 import pandas as pd
 
 from marketdata.fetch_config import Config, _cg_get
-
-_DAYS = 365   # free demo tier hard limit for market_chart?days=
 
 
 class CoinGeckoOHLCVAdapter:
@@ -78,34 +75,3 @@ class CoinGeckoOHLCVAdapter:
         df["time"] = pd.to_datetime(df["ts_ms"], unit="ms", utc=True).dt.round("h")
         df = df.drop_duplicates(subset="time", keep="last")
         return df.set_index("time")["close"].sort_index()
-
-
-class CoinGeckoMarketCapAdapter:
-    """
-    Fetches daily circulating market cap from CoinGecko /coins/{id}/market_chart.
-
-    One request per coin regardless of the requested date range.
-    Data older than _DAYS days is unavailable on the free demo tier and
-    will be absent from the returned DataFrame (forward-filled by signals).
-    """
-
-    def fetch(
-        self, symbol: str, start: pd.Timestamp, end: pd.Timestamp
-    ) -> pd.DataFrame:
-        """Return a daily market_cap DataFrame sliced to [start, end]."""
-        data = _cg_get(
-            f"/coins/{symbol}/market_chart",
-            {"vs_currency": Config.VS_CURRENCY, "days": _DAYS},
-        )
-        rows = data.get("market_caps", [])
-        if not rows:
-            return pd.DataFrame(columns=["market_cap"])
-
-        df = pd.DataFrame(rows, columns=["ts_ms", "market_cap"])
-        df["time"] = pd.to_datetime(df["ts_ms"], unit="ms", utc=True).dt.normalize()
-        df = (
-            df.drop_duplicates("time", keep="last")
-            .set_index("time")[["market_cap"]]
-            .sort_index()
-        )
-        return df.loc[start:end]

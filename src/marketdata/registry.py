@@ -22,6 +22,10 @@ class SourceRegistration:
     strategy:   GapStrategy
     priority:   int = 0
     columns:    Optional[list[str]] = None  # post-fetch column filter; None = keep all
+    # Bar width. Every current source is hourly, so the default is correct
+    # everywhere today; a future sub-hourly source must set this explicitly or
+    # _fill_gaps's "is this bar closed yet" check silently uses the wrong unit.
+    interval:   pd.Timedelta = pd.Timedelta(hours=1)
 
 
 @dataclass

@@ -20,6 +20,10 @@ COIN_ID_OVERRIDES: dict[str, dict[str, str]] = {
     "hyperliquid": {
         "tokamak-network": "TOKAMAK",   # CG symbol "ton" collides with the-open-network
         "saakuru-labs":    "SAAKURU",   # real HL SKR is seeker; saakuru has no HL perp
+        # HL's MEME is memecoin-2 (Memeland, $0.000505 vs CG $0.000506). MEMETOON
+        # shares the CG symbol "meme" but CoinGecko reports NO exchange tickers
+        # for it at all — it is not on HL. Resolves to nothing, as intended.
+        "memetoon":        "MEMETOON",
         # 1000x (k-prefix) perps — HL API is case-sensitive; "kBONK" ≠ "KBONK".
         # Must be in COIN_ID_OVERRIDES (not SYMBOL_OVERRIDES) to bypass the
         # .upper() fallback in resolve_symbol and preserve the lowercase 'k'.
@@ -33,6 +37,57 @@ COIN_ID_OVERRIDES: dict[str, dict[str, str]] = {
     },
     "binance": {
         "tokamak-network": "TOKAMAK",
+        # CG symbol "lit" collides with litentry (rank 1194); "lighter" (rank 72,
+        # the Lighter exchange token) is the one traded on Lighter's own book and
+        # the one this override must resolve to. Spot LITUSDT is Litentry, not
+        # Lighter — without this, resolve_symbol's .upper() fallback would price
+        # the Lighter position against an unrelated $0.74 token.
+        "lighter": "LIT",
+        # Binance MEMEUSDT (listed 2023-11-01) is memecoin-2 — CoinGecko reports
+        # it as MEME/USDT on Binance with ~$630k/day. MEMETOON has no Binance
+        # market at all.
+        "memetoon": "MEMETOON",
+        # AIUSDT on Binance is sleepless-ai, NOT either "AI"-symbol coin below.
+        # Gensyn really does trade on Binance, but as AIGENSYN (~$790k/day); its
+        # "AI" ticker is an OKX/Upbit convention CoinGecko reports as the symbol.
+        "gensyn": "AIGENSYN",
+        # Artificial Inu trades only on Robinhood-chain DEXes (Bankr, Uniswap) —
+        # no Binance listing, so it must not inherit sleepless-ai's AIUSDT.
+        "artificial-inu-3": "ARTINU",
+    },
+    # Futures listings are their own set — same rebrands as spot, but the
+    # multiplier perps (SHIB → 1000SHIBUSDT) need no entry here: the resolver
+    # tries multiplier prefixes itself, so only genuine ticker mismatches do.
+    "binance_futures": {
+        "tokamak-network": "TOKAMAK",   # CG symbol "ton" collides with the-open-network
+        # Unlike spot, futures LITUSDT (onboarded 2025-12-23) actually is the
+        # Lighter token with no prior Litentry history on the symbol — so this
+        # entry is not correcting a resolved collision, just making the
+        # resolution explicit rather than incidental to onboarding order.
+        "lighter": "LIT",
+        # Symbol collisions resolved by matching the perp's mark price against
+        # each candidate's CoinGecko price (2026-09-10). In every pair below the
+        # LOSER is pinned to a name Binance does not list, so it correctly
+        # resolves to "not listed here" rather than inheriting the winner's book.
+        #
+        #   MEMEUSDT -> memecoin-2   (memetoon has no CEX listing anywhere)
+        #   SAFEUSDT -> safe         (safecoin is SAFEbit, 25% off the mark)
+        #   MUSDT    -> memecore     (mantis 59% off)
+        #   BUSDT    -> build-on     (baseline 1527% off)
+        #   ARXUSDT  -> arcium       (arcs 94% off)
+        #   PRLUSDT  -> perle        (pearl-2 313% off)
+        #   EDGEUSDT -> edgex        (definitive 87% off)
+        #
+        # arcium and perle are the two that a first-wins tiebreak got BACKWARDS:
+        # market-cap order put arcs and pearl-2 first, and both are the wrong
+        # book. Price is the only thing that settles these.
+        "memetoon":   "MEMETOON",
+        "safecoin":   "SAFEBIT",
+        "mantis":     "MANTIS",
+        "baseline":   "BASELINE",
+        "arcs":       "ARCS",
+        "pearl-2":    "PEARL",
+        "definitive": "DEFINITIVE",
     },
 }
 
@@ -51,6 +106,12 @@ SYMBOL_OVERRIDES: dict[str, dict[str, str]] = {
         "rndr":  "RENDER",
         "ftm":   "S",       # Fantom rebranded to Sonic (S) on HL
     },
+    "binance_futures": {
+        "xbt":   "BTC",
+        "miota": "IOTA",
+        "rndr":  "RENDER",  # RNDRUSDT delisted; RENDERUSDT is the live perp
+        "ftm":   "S",       # FTMUSDT delisted; SUSDT is the live perp
+    },
 }
 
 
@@ -67,7 +128,7 @@ def resolve_symbol(cg_symbol: str, exchange: str, coin_id: str = "") -> str:
     Pass coin_id whenever available; it eliminates ambiguity when two coins
     share the same CoinGecko symbol (e.g. "ton" for the-open-network and
     tokamak-network).  Add entries to COIN_ID_OVERRIDES to fix collisions
-    flagged by the dedup warning in hl_eligible / binance_eligible.
+    flagged by the dedup warning in the trading system's universe/venues.py.
     """
     if coin_id:
         ticker = COIN_ID_OVERRIDES.get(exchange, {}).get(coin_id)
@@ -162,6 +223,12 @@ class Config:
     CG_API_BASE    = "https://api.coingecko.com/api/v3"
     HL_API      = "https://api.hyperliquid.xyz/info"
     BINANCE_API = "https://api.binance.com/api/v3"
+    # USDⓈ-M futures is a separate host from spot, with its own listings:
+    # funding exists only here, and the perp and spot symbol sets differ.
+    BINANCE_FAPI = "https://fapi.binance.com/fapi/v1"
+    # Lighter's Robinhood-chain deployment. Its own book — the venue lit_* wallets
+    # execute on — so funding read here is execution funding, not a reference series.
+    LIGHTER_API = "https://api.rh.lighter.xyz/api/v1"
     VS_CURRENCY = "usd"
 
     # ── cache ─────────────────────────────────────────────────────────────────────
@@ -181,6 +248,16 @@ class Config:
     # 0.5 s sleep keeps us well under the limit even for 117 coins × 9 calls.
     BINANCE_REQUEST_SLEEP = 0.5
     BINANCE_KLINES_LIMIT  = 1000   # bars per call — Binance max
+
+    # ── Lighter rate limiting ─────────────────────────────────────────────────────
+    # A standard (non-Premium) account gets 60 requests per rolling minute across
+    # ALL endpoints, which is two orders of magnitude tighter than Binance's. 1.1 s
+    # keeps a full-universe backfill inside that on its own, without depending on
+    # how many coins the caller happens to be fetching.
+    LIGHTER_REQUEST_SLEEP = 1.1
+    # What we ASK for via count_back. Lighter actually returns 749; never use
+    # this as a "was the page short?" end-of-history test (see lighter_adapter).
+    LIGHTER_FUNDING_LIMIT = 750
 
     # ── stablecoin / exclusion filters ───────────────────────────────────────────
     # CoinGecko 'categories' keywords — any match → excluded from the general universe

@@ -30,8 +30,7 @@ from typing import ClassVar, Optional
 import pandas as pd
 import requests
 
-from marketdata.fetch_config import Config, resolve_symbol
-from marketdata.coin_registry import load as _load_registry, symbol_of
+from marketdata.fetch_config import Config
 
 log = logging.getLogger(__name__)
 
@@ -82,14 +81,13 @@ class BinanceAdapter:
         Return the Binance USDT pair for this coin (e.g. "BTCUSDT"),
         or None if no active USDT pair exists.
 
-        Ensures coin_id is in the CoinGecko registry before resolution.
         Called as resolve_fn in SourceRegistration — must be self-contained.
         """
-        try:
-            _load_registry([coin_id])
-        except KeyError:
+        from marketdata.assets import ticker_on
+
+        base = ticker_on(coin_id, "binance")
+        if not base:
             return None
-        base      = resolve_symbol(symbol_of(coin_id), "binance", coin_id)
         candidate = f"{base}USDT"
         return candidate if candidate in self._load_pairs() else None
 
@@ -112,7 +110,10 @@ class BinanceAdapter:
             chunks.append(page)
             if len(page) < Config.BINANCE_KLINES_LIMIT:
                 break
-            cursor = page.index[-1] + pd.Timedelta(hours=1)
+            # Index is already open_time + 1h (see _fetch_page) — page.index[-1]
+            # IS the next bar's open time. Adding another hour here skipped one
+            # bar at every page boundary (~9k bars silently missing in cache).
+            cursor = page.index[-1]
             time.sleep(Config.BINANCE_REQUEST_SLEEP)
 
         if not chunks:
