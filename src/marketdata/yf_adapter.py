@@ -18,6 +18,7 @@ Granularity auto-fallback:
 Prices are adjusted (auto_adjust=True). All timestamps are returned as UTC.
 """
 
+import warnings
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -25,7 +26,7 @@ import yfinance as yf
 
 from marketdata.fetch_config import _to_utc
 
-_MAX_HOURLY_DAYS = 730
+_MAX_HOURLY_DAYS = 728  # Yahoo's limit is 730d at request time; margin avoids a boundary race
 _OHLCV_COLS = ["open", "high", "low", "close", "volume"]
 
 
@@ -62,6 +63,10 @@ class YFinanceAdapter:
         if daily.empty:
             return hourly
         if hourly.empty:
+            warnings.warn(
+                f"{yf_ticker}: hourly leg empty, history stops at {daily.index[-1]}",
+                stacklevel=2,
+            )
             return daily
 
         combined = pd.concat([daily, hourly])
