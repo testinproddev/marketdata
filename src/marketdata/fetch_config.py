@@ -24,6 +24,9 @@ COIN_ID_OVERRIDES: dict[str, dict[str, str]] = {
         # shares the CG symbol "meme" but CoinGecko reports NO exchange tickers
         # for it at all — it is not on HL. Resolves to nothing, as intended.
         "memetoon":        "MEMETOON",
+        # CG symbol "xai" is shared; HL's XAI is xai-blockchain (mid $0.00865 vs CG
+        # $0.00869). SideShift ($0.199, 96% off) has no HL perp. Priced 2026-10-16.
+        "sideshift-token": "SIDESHIFT",
         # 1000x (k-prefix) perps — HL API is case-sensitive; "kBONK" ≠ "KBONK".
         # Must be in COIN_ID_OVERRIDES (not SYMBOL_OVERRIDES) to bypass the
         # .upper() fallback in resolve_symbol and preserve the lowercase 'k'.
@@ -54,6 +57,12 @@ COIN_ID_OVERRIDES: dict[str, dict[str, str]] = {
         # Artificial Inu trades only on Robinhood-chain DEXes (Bankr, Uniswap) —
         # no Binance listing, so it must not inherit sleepless-ai's AIUSDT.
         "artificial-inu-3": "ARTINU",
+        # Shared CG symbols, settled by price 2026-10-16. ONEUSDT is harmony
+        # ($0.00157 vs CG $0.00156; cross-2 = ONEchain $0.107, 99% off) and XAIUSDT
+        # is xai-blockchain (0% off; sideshift-token 96% off). Market-cap order had
+        # kept the impostor in both, with five years of Harmony's bars under cross-2.
+        "cross-2":          "ONECHAIN",
+        "sideshift-token":  "SIDESHIFT",
     },
     # Futures listings are their own set — same rebrands as spot, but the
     # multiplier perps (SHIB → 1000SHIBUSDT) need no entry here: the resolver
@@ -77,6 +86,8 @@ COIN_ID_OVERRIDES: dict[str, dict[str, str]] = {
         #   ARXUSDT  -> arcium       (arcs 94% off)
         #   PRLUSDT  -> perle        (pearl-2 313% off)
         #   EDGEUSDT -> edgex        (definitive 87% off)
+        #   ONEUSDT  -> harmony      (cross-2 / ONEchain 99% off)       2026-10-16
+        #   XAIUSDT  -> xai-blockchain (sideshift-token 96% off)        2026-10-16
         #
         # arcium and perle are the two that a first-wins tiebreak got BACKWARDS:
         # market-cap order put arcs and pearl-2 first, and both are the wrong
@@ -88,6 +99,8 @@ COIN_ID_OVERRIDES: dict[str, dict[str, str]] = {
         "arcs":       "ARCS",
         "pearl-2":    "PEARL",
         "definitive": "DEFINITIVE",
+        "cross-2":         "ONECHAIN",
+        "sideshift-token": "SIDESHIFT",
     },
 }
 
