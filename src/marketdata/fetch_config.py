@@ -27,6 +27,9 @@ COIN_ID_OVERRIDES: dict[str, dict[str, str]] = {
         # CG symbol "xai" is shared; HL's XAI is xai-blockchain (mid $0.00865 vs CG
         # $0.00869). SideShift ($0.199, 96% off) has no HL perp. Priced 2026-10-16.
         "sideshift-token": "SIDESHIFT",
+        # CG symbol "data" is Streamr's (shared by five ids); story-2 is Story, HL "IP".
+        # Its cached HL funding matches IP row for row. Checked 2026-10-28.
+        "story-2":         "IP",
         # 1000x (k-prefix) perps — HL API is case-sensitive; "kBONK" ≠ "KBONK".
         # Must be in COIN_ID_OVERRIDES (not SYMBOL_OVERRIDES) to bypass the
         # .upper() fallback in resolve_symbol and preserve the lowercase 'k'.
