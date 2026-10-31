@@ -40,6 +40,14 @@ COIN_ID_OVERRIDES: dict[str, dict[str, str]] = {
         "neiro-3":    "kNEIRO",
         "terra-luna": "kLUNC",
         "dogs-2":     "kDOGS",
+        # Shared tickers, settled by price 2026-10-31 (allMids vs CoinGecko). Each LOSER
+        # is pinned to a name HL does not list, so a fetch by id stops resolving to the
+        # winner's book:  BTC -> bitcoin (big-titty-coin 270,000,000% off), DOT ->
+        # polkadot (dot 11,780% off), BABY -> babylon (babycashcat 20% off).
+        # "dot" is already its own CG symbol, so a pin spelled DOT would be a no-op.
+        "big-titty-coin": "BIGTITTYCOIN",
+        "dot":            "DOTCOIN",
+        "babycashcat":    "BABYCASHCAT",
     },
     "binance": {
         "tokamak-network": "TOKAMAK",
@@ -66,6 +74,23 @@ COIN_ID_OVERRIDES: dict[str, dict[str, str]] = {
         # kept the impostor in both, with five years of Harmony's bars under cross-2.
         "cross-2":          "ONECHAIN",
         "sideshift-token":  "SIDESHIFT",
+        # Shared tickers, settled 2026-10-31. Spot pairs the loser is pinned off, winner
+        # first (the loser's CoinGecko price is that far from the Binance book):
+        #   BTCUSDT  bitcoin       big-titty-coin 270,000,000%   DOTUSDT   polkadot  dot 11,819%
+        #   BABYUSDT babylon       babycashcat 21%               MASKUSDT  mask-network  nullmask 1,122%
+        #   AVAUSDT  concierge-io  ava-ai 4,127%                 TREEUSDT  treehouse  tree-capital 77%
+        #   JOEUSDT  joe           joe-coin 364%
+        # ACTUSDT is act-i-the-ai-prophecy, not achain, though price cannot say so (CG
+        # prices the two within 0.5%): the book's first bar is 2024-11-11, and CG lists
+        # ACT/USDT on Binance for act-i only. "dot" is its own CG symbol, hence DOTCOIN.
+        "big-titty-coin": "BIGTITTYCOIN",
+        "dot":            "DOTCOIN",
+        "babycashcat":    "BABYCASHCAT",
+        "nullmask":       "NULLMASK",
+        "ava-ai":         "AVAAI",
+        "tree-capital":   "TREECAPITAL",
+        "joe-coin":       "JOECOIN",
+        "achain":         "ACHAIN",
     },
     # Futures listings are their own set — same rebrands as spot, but the
     # multiplier perps (SHIB → 1000SHIBUSDT) need no entry here: the resolver
@@ -104,6 +129,23 @@ COIN_ID_OVERRIDES: dict[str, dict[str, str]] = {
         "definitive": "DEFINITIVE",
         "cross-2":         "ONECHAIN",
         "sideshift-token": "SIDESHIFT",
+        # More collisions, settled 2026-10-31 (mark price vs CoinGecko). Same pairs as
+        # spot plus TRUSTUSDT -> intuition (trust-3 77,482% off); the loser's distance
+        # from the mark is in spot's comment above. ACTUSDT is act-i-the-ai-prophecy by
+        # first-bar date, not price (see spot). "dot" is its own CG symbol: DOTCOIN.
+        #
+        # ava-ai is the exception: AVAAIUSDT (onboarded 2025-01-17) IS Ava AI's own perp
+        # (mark 0.006733 vs CG 0.006709), so its pin names a real book and the coin
+        # becomes tradable here rather than merely dropped.
+        "big-titty-coin": "BIGTITTYCOIN",
+        "dot":            "DOTCOIN",
+        "babycashcat":    "BABYCASHCAT",
+        "nullmask":       "NULLMASK",
+        "ava-ai":         "AVAAI",
+        "tree-capital":   "TREECAPITAL",
+        "joe-coin":       "JOECOIN",
+        "trust-3":        "TRUST3",
+        "achain":         "ACHAIN",
     },
 }
 
