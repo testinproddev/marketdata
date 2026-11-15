@@ -28,9 +28,8 @@ import time
 from typing import ClassVar, Optional
 
 import pandas as pd
-import requests
 
-from marketdata.fetch_config import Config
+from marketdata.fetch_config import SESSION, Config
 
 log = logging.getLogger(__name__)
 
@@ -43,7 +42,7 @@ _ALL_COLS = _OHLC_COLS + _EXTRA_COLS
 
 
 def _binance_get(path: str, params: dict) -> list:
-    r = requests.get(f"{Config.BINANCE_API}{path}", params=params, timeout=60)
+    r = SESSION.get(f"{Config.BINANCE_API}{path}", params=params, timeout=60)
     r.raise_for_status()
     return r.json()
 

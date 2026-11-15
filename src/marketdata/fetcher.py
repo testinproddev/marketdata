@@ -45,6 +45,10 @@ class Fetcher:
         # re-derived so callers persist what produced the data, not what a
         # second resolution would pick today (registry priorities change).
         self.last_provenance: dict[str, dict[str, str]] = {}
+        # Same shape, for assets whose gap fetch raised in the most recent fetch(): whatever
+        # is cached for them may lack the newest bars, and they appear here even when
+        # nothing is cached at all.
+        self.last_unrefreshed: dict[str, dict[str, str]] = {}
 
     def fetch(
         self,
@@ -76,6 +80,7 @@ class Fetcher:
         n        = len(plan)
         result:  dict[str, pd.DataFrame] = {}
         self.last_provenance = {}
+        self.last_unrefreshed = {}
 
         for i, (asset_id, resolved) in enumerate(plan.items(), 1):
             reg  = resolved.registration
@@ -87,8 +92,12 @@ class Fetcher:
             )
             log.debug("[%3d/%d]  %-44s  %s", i, n, asset_id, status)
 
-            if gaps:
-                _fill_gaps(self._store, reg, resolved.symbol, asset_id, gaps)
+            if gaps and not _fill_gaps(self._store, reg, resolved.symbol, asset_id, gaps):
+                self.last_unrefreshed[asset_id] = {
+                    "provider":  str(reg.provider),
+                    "symbol":    resolved.symbol,
+                    "data_type": str(data_type),
+                }
 
             cached = self._store.load(asset_id, data_type, reg.provider)
             if cached is not None and not cached.empty:
@@ -104,6 +113,11 @@ class Fetcher:
                     }
 
         log.info("%s data ready for %d / %d assets", data_type, len(result), len(asset_ids))
+        if self.last_unrefreshed:
+            log.warning(
+                "%s: %d asset(s) not refreshed (fetch failed): %s",
+                data_type, len(self.last_unrefreshed), sorted(self.last_unrefreshed),
+            )
         return result
 
 
@@ -120,10 +134,10 @@ def _fill_gaps(
     symbol:   str,
     asset_id: str,
     gaps:     list[tuple[pd.Timestamp, pd.Timestamp]],
-) -> None:
-    """Fetch each gap window, merge with cached data, and persist.
+) -> bool:
+    """Fetch each gap window, merge with cached data, and persist; False if any gap fetch raised.
 
-    Per-gap errors are caught and printed; other gaps and other assets continue.
+    Per-gap errors are caught and logged; other gaps and other assets continue.
     An empty response is recorded only for a pre-listing window. With earlier
     data cached it is a failed fetch: recording it as covered hid a year of
     Hyperliquid funding from every later fetch, so the gap is left open instead.
@@ -146,6 +160,7 @@ def _fill_gaps(
     cached           = store.load(asset_id, reg.data_type, reg.provider)
     new_chunks: list[pd.DataFrame] = []
     complete_through = pd.Timestamp.now(tz="UTC").floor(reg.interval)
+    refreshed        = True
 
     for gs, ge in gaps:
         try:
@@ -155,6 +170,7 @@ def _fill_gaps(
                 "%s [%s.%s] %s-%s: %s",
                 asset_id, reg.provider, reg.data_type, gs.date(), ge.date(), exc,
             )
+            refreshed = False
             continue  # leave gap open — retry on next run
 
         if reg.columns is not None and not chunk.empty:
@@ -179,7 +195,7 @@ def _fill_gaps(
         # leave it open for a later run to pick up once it has.
 
     if not new_chunks:
-        return
+        return refreshed
 
     new_data = pd.concat(new_chunks)
     new_data = new_data[~new_data.index.duplicated(keep="last")]
@@ -191,3 +207,4 @@ def _fill_gaps(
         merged = new_data.sort_index()
 
     store.save(asset_id, reg.data_type, reg.provider, merged)
+    return refreshed

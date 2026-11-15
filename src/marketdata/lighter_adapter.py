@@ -54,9 +54,8 @@ import time
 from typing import ClassVar, Optional
 
 import pandas as pd
-import requests
 
-from marketdata.fetch_config import Config
+from marketdata.fetch_config import SESSION, Config
 
 log = logging.getLogger(__name__)
 
@@ -68,7 +67,7 @@ _DIRECTION_SIGN = {"long": 1.0, "short": -1.0}
 
 
 def _lighter_get(path: str, params: dict) -> dict:
-    r = requests.get(f"{Config.LIGHTER_API}{path}", params=params, timeout=60)
+    r = SESSION.get(f"{Config.LIGHTER_API}{path}", params=params, timeout=60)
     r.raise_for_status()
     return r.json()
 

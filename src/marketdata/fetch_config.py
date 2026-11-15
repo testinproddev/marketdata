@@ -1,11 +1,17 @@
+from contextlib import contextmanager
 from pathlib import Path
 import logging
 import os
+import time
 import requests
 
 import pandas as pd
 
 log = logging.getLogger(__name__)
+
+# One keep-alive pool for the exchange adapters: a fresh TLS handshake per request
+# doubled HL fetch time (683 ms vs 306 ms per candle request).
+SESSION = requests.Session()
 
 
 def _to_utc(dt) -> pd.Timestamp:
@@ -196,15 +202,42 @@ def resolve_symbol(cg_symbol: str, exchange: str, coin_id: str = "") -> str:
     return SYMBOL_OVERRIDES.get(exchange, {}).get(sym, sym).upper()
 
 
+_hl_last_start = float("-inf")
+_hl_retry_left: float | None = None
+
+
+@contextmanager
+def hl_retry_budget(seconds: float):
+    """Inside the block an HL 429 is waited out, `seconds` of waiting in all; outside it raises."""
+    global _hl_retry_left
+    outer, _hl_retry_left = _hl_retry_left, float(seconds)
+    try:
+        yield
+    finally:
+        _hl_retry_left = outer
+
+
 def _hl_post(payload: dict) -> list | dict:
-    r = requests.post(
-        Config.HL_API,
-        json=payload,
-        headers={"Content-Type": "application/json"},
-        timeout=60,
-    )
-    r.raise_for_status()
-    return r.json()
+    """POST to HL's info API at Config.HL_MIN_INTERVAL; a 429 retries only in hl_retry_budget."""
+    global _hl_last_start, _hl_retry_left
+    for cooldown in (*Config.HL_429_COOLDOWNS, None):
+        pause = _hl_last_start + Config.HL_MIN_INTERVAL - time.monotonic()
+        if pause > 0:
+            time.sleep(pause)
+        _hl_last_start = time.monotonic()
+        r = SESSION.post(
+            Config.HL_API,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=60,
+        )
+        if (r.status_code != 429 or cooldown is None
+                or _hl_retry_left is None or cooldown > _hl_retry_left):
+            r.raise_for_status()
+            return r.json()
+        _hl_retry_left -= cooldown
+        log.warning("HL 429 — waiting %ds (%ds of retry budget left)", cooldown, _hl_retry_left)
+        time.sleep(cooldown)
 
 
 def _cg_get(path: str, params: dict) -> dict:
@@ -306,6 +339,14 @@ class Config:
     # 0.5 s sleep keeps us well under the limit even for 117 coins × 9 calls.
     BINANCE_REQUEST_SLEEP = 0.5
     BINANCE_KLINES_LIMIT  = 1000   # bars per call — Binance max
+
+    # ── Hyperliquid rate limiting ─────────────────────────────────────────────────
+    # The docs give 1200 weight/min per IP (~21 per candle/funding call, ~57 calls/min), but
+    # the enforced limit is looser: ~82 calls/min ran for months with almost no 429s, while
+    # a reused connection at ~190/min drew 34 in one load. Pace to the measured rate.
+    # The docs name no Retry-After, so a 429 waits these cooldowns in turn.
+    HL_MIN_INTERVAL  = 0.75
+    HL_429_COOLDOWNS = (15, 30)
 
     # ── Lighter rate limiting ─────────────────────────────────────────────────────
     # A standard (non-Premium) account gets 60 requests per rolling minute across
