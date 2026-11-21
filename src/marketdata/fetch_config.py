@@ -208,7 +208,8 @@ _hl_retry_left: float | None = None
 
 @contextmanager
 def hl_retry_budget(seconds: float):
-    """Inside the block an HL 429 is waited out, `seconds` of waiting in all; outside it raises."""
+    """Inside the block a retryable HL failure is waited out, `seconds` of waiting in all;
+    outside it raises."""
     global _hl_retry_left
     outer, _hl_retry_left = _hl_retry_left, float(seconds)
     try:
@@ -217,27 +218,41 @@ def hl_retry_budget(seconds: float):
         _hl_retry_left = outer
 
 
+def _hl_retriable(exc: requests.RequestException) -> bool:
+    if isinstance(exc, requests.HTTPError):
+        return exc.response is not None and (
+            exc.response.status_code == 429 or exc.response.status_code >= 500)
+    return isinstance(exc, (requests.ConnectionError, requests.Timeout))
+
+
 def _hl_post(payload: dict) -> list | dict:
-    """POST to HL's info API at Config.HL_MIN_INTERVAL; a 429 retries only in hl_retry_budget."""
+    """POST to HL's info API at Config.HL_MIN_INTERVAL; a 429, 5xx, connection error or timeout
+    retries only in hl_retry_budget."""
     global _hl_last_start, _hl_retry_left
     for cooldown in (*Config.HL_429_COOLDOWNS, None):
         pause = _hl_last_start + Config.HL_MIN_INTERVAL - time.monotonic()
         if pause > 0:
             time.sleep(pause)
         _hl_last_start = time.monotonic()
-        r = SESSION.post(
-            Config.HL_API,
-            json=payload,
-            headers={"Content-Type": "application/json"},
-            timeout=60,
-        )
-        if (r.status_code != 429 or cooldown is None
-                or _hl_retry_left is None or cooldown > _hl_retry_left):
+        try:
+            r = SESSION.post(
+                Config.HL_API,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=60,
+            )
             r.raise_for_status()
             return r.json()
-        _hl_retry_left -= cooldown
-        log.warning("HL 429 — waiting %ds (%ds of retry budget left)", cooldown, _hl_retry_left)
-        time.sleep(cooldown)
+        except requests.RequestException as exc:
+            if (cooldown is None or _hl_retry_left is None or cooldown > _hl_retry_left
+                    or not _hl_retriable(exc)):
+                raise
+            _hl_retry_left -= cooldown
+            what = (exc.response.status_code if isinstance(exc, requests.HTTPError)
+                    else type(exc).__name__)
+            log.warning("HL %s — waiting %ds (%ds of retry budget left)",
+                        what, cooldown, _hl_retry_left)
+            time.sleep(cooldown)
 
 
 def _cg_get(path: str, params: dict) -> dict:
@@ -344,9 +359,10 @@ class Config:
     # The docs give 1200 weight/min per IP (~21 per candle/funding call, ~57 calls/min), but
     # the enforced limit is looser: ~82 calls/min ran for months with almost no 429s, while
     # a reused connection at ~190/min drew 34 in one load. Pace to the measured rate.
-    # The docs name no Retry-After, so a 429 waits these cooldowns in turn.
+    # The docs name no Retry-After, and the limit is per minute: a retryable failure waits these
+    # cooldowns in turn, the first long enough to clear most of a window.
     HL_MIN_INTERVAL  = 0.75
-    HL_429_COOLDOWNS = (15, 30)
+    HL_429_COOLDOWNS = (30, 60, 60)
 
     # ── Lighter rate limiting ─────────────────────────────────────────────────────
     # A standard (non-Premium) account gets 60 requests per rolling minute across
