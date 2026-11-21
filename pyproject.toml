@@ -9,6 +9,7 @@ dependencies = [
     "numpy>=1.26",
     "pyarrow>=14.0",
     "yfinance>=0.2",
+    "exchange_calendars>=4.5",
 ]
 
 [project.urls]

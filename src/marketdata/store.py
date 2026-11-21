@@ -191,6 +191,23 @@ class DataStore:
         )
         os.replace(tmp, path)  # atomic on both POSIX and Windows
 
+    def forget(
+        self, asset_id: str, data_type: DataType, provider: DataProvider, keep_file: bool = False,
+    ) -> None:
+        """Drop a series so the next fetch refetches it whole: manifest row first, then the file.
+
+        Row first: a crash between the two leaves a file with no coverage, which the next fetch
+        re-checks; the other order claims coverage with no file, so a fetch would save only the
+        new tail as the series. `keep_file` leaves the file for a replacement `save` to overwrite.
+        """
+        self._conn.execute(
+            "DELETE FROM manifest WHERE asset_id=? AND data_type=? AND provider=?",
+            (asset_id, str(data_type), str(provider)),
+        )
+        self._conn.commit()
+        if not keep_file:
+            self._path(asset_id, data_type, provider).unlink(missing_ok=True)
+
     def schema_version(
         self, asset_id: str, data_type: DataType, provider: DataProvider,
     ) -> Optional[int]:

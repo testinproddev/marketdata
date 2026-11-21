@@ -37,11 +37,15 @@ _FX_OVERRIDES: dict[str, str] = {
 }
 
 _STOCK_OVERRIDES: dict[str, str] = {
+    "CAMBRICON": "688256.SS",  # Cambricon Technologies, Shanghai STAR
     "HYUNDAI":  "005380.KS",  # Hyundai Motor Co, KRX
-    "KIOXIA":   "6600.T",     # Kioxia Holdings, TSE (IPO Dec 2024 — may be absent from YF)
+    "KIOXIA":   "285A.T",     # Kioxia Holdings, TSE (code 285A, not 6600)
+    "MINIMAX":  "0100.HK",    # MiniMax, HKEX
+    "RELIANCE": "RELIANCE.BO",  # Reliance Industries, BSE (exchange_calendars has no XNSE)
     "SKHX":     "000660.KS",  # SK Hynix, KRX
     "SMSN":     "005930.KS",  # Samsung Electronics, KRX
     "SOFTBANK": "9984.T",     # SoftBank Group Corp, TSE
+    "ZHIPU":    "2513.HK",    # Zhipu AI (Knowledge Atlas), HKEX
 }
 
 # Stocks whose HL symbol has no correct public tape. Two failure modes, one
@@ -60,11 +64,10 @@ _NO_UNDERLYING_TAPE: dict[str, str] = {
     "SPCX":    "no public listing — SpaceX is private; Yahoo's SPCX is an unrelated former SPAC",
     "CXMT":    "no public listing — ChangXin Memory (STAR 688825), no Yahoo tape",
     "UNITREE": "no public listing — Unitree (STAR 688836), no Yahoo tape",
-    "ZHIPU":   "no public listing — Zhipu AI, no Yahoo tape",
-    "MINIMAX": "no public listing — MiniMax, no Yahoo tape",
     "GIGADEV": "no public listing — GigaDevice, no Yahoo tape",
     "PURRDAT": "not an equity — a Hyperliquid-native synthetic",
-    "KIOXIA":  "absent from Yahoo — Kioxia lists on TSE (6600) but Yahoo returns no data",
+    "JIO":     "Jio Platforms (xyz keyword 'jpl'); no verified Yahoo tape — JPL.NS is unconfirmed",
+    "SHEIN":   "no Yahoo tape found for the bare symbol (2026-11-16)",
 }
 
 _INDEX_OVERRIDES: dict[str, str] = {
@@ -105,6 +108,8 @@ _SUFFIX_CALENDARS: dict[str, str] = {
     ".AS": "XAMS",
     ".SW": "XSWX",
     ".TO": "XTSE",
+    ".SS": "XSHG",   # Shanghai
+    ".BO": "XBOM",   # BSE
 }
 
 # US equities default here. XNYS rather than XNAS deliberately: the two keep the
@@ -115,16 +120,15 @@ _US_EQUITY_CALENDAR = "XNYS"
 
 # Calendars for stocks whose Yahoo ticker cannot supply one — either because
 # there is no ticker (_NO_UNDERLYING_TAPE) or because the listing venue is not
-# encoded in it. A missing tape is not a missing session: Kioxia keeps Tokyo
+# encoded in it. A missing tape is not a missing session: CXMT keeps Shanghai
 # hours whether or not Yahoo serves its prices, and its orders must still be
 # gated on that session.
 #
 # Names genuinely without a public session are deliberately absent, so
-# resolve_mic returns None for them rather than a guess: SPCX, ZHIPU, MINIMAX
-# and PURRDAT reference private issuers or a synthetic, whose perps have no
-# external reference to be open or closed against.
+# resolve_mic returns None for them rather than a guess: SPCX and PURRDAT
+# reference a private issuer or a synthetic, whose perps have no external
+# reference to be open or closed against.
 _STOCK_CALENDARS: dict[str, str] = {
-    "KIOXIA":  "XTKS",   # TSE 6600
     "CXMT":    "XSHG",   # Shanghai STAR 688825
     "UNITREE": "XSHG",   # Shanghai STAR 688836
     "GIGADEV": "XSHG",   # Shanghai STAR

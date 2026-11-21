@@ -16,6 +16,7 @@ This class orchestrates; it contains no source-specific knowledge.
 from __future__ import annotations
 
 import logging
+import math
 
 import pandas as pd
 
@@ -25,6 +26,13 @@ from marketdata.registry import SourceRegistration, SourceRegistry
 from marketdata.store import DataStore
 
 log = logging.getLogger(__name__)
+
+_REBASE_RTOL = 1e-4  # a re-fetched bar's close must match the cached one within this
+_OLDEST_PROBE_WINDOW = pd.Timedelta(days=7)  # the oldest bar's probe also reads this far on
+
+
+def _now() -> pd.Timestamp:
+    return pd.Timestamp.now(tz="UTC")
 
 
 class Fetcher:
@@ -45,9 +53,10 @@ class Fetcher:
         # re-derived so callers persist what produced the data, not what a
         # second resolution would pick today (registry priorities change).
         self.last_provenance: dict[str, dict[str, str]] = {}
-        # Same shape, for assets whose gap fetch raised in the most recent fetch(): whatever
-        # is cached for them may lack the newest bars, and they appear here even when
-        # nothing is cached at all.
+        # Same shape, for assets the most recent fetch() could not refresh (a gap fetch raised,
+        # or a rebases source's cached basis could not be checked or its series replaced): whatever
+        # is cached for them may lack the newest bars, and they appear here even when nothing is
+        # cached at all.
         self.last_unrefreshed: dict[str, dict[str, str]] = {}
 
     def fetch(
@@ -60,7 +69,8 @@ class Fetcher:
         """
         Return DataFrames for [start, end] for all resolvable assets.
 
-        Only fetches windows not already covered by the cache manifest.
+        Only fetches windows not already covered by the cache manifest (a rebased series is
+        dropped and fetched whole).
         Assets with no registered source for data_type are excluded from result.
 
         Parameters
@@ -92,7 +102,18 @@ class Fetcher:
             )
             log.debug("[%3d/%d]  %-44s  %s", i, n, asset_id, status)
 
-            if gaps and not _fill_gaps(self._store, reg, resolved.symbol, asset_id, gaps):
+            refreshed = True
+            if gaps and reg.rebases:
+                basis = _basis_holds(self._store, reg, resolved.symbol, asset_id, data_type)
+                if basis is None:
+                    refreshed = False  # cannot tell which basis the cache is on: leave it alone
+                elif not basis:
+                    refreshed = _replace_series(
+                        self._store, reg, resolved.symbol, asset_id, start_ts, end_ts)
+                    gaps = []
+            if refreshed and gaps:
+                refreshed = _fill_gaps(self._store, reg, resolved.symbol, asset_id, gaps)
+            if not refreshed:
                 self.last_unrefreshed[asset_id] = {
                     "provider":  str(reg.provider),
                     "symbol":    resolved.symbol,
@@ -119,6 +140,115 @@ class Fetcher:
                 data_type, len(self.last_unrefreshed), sorted(self.last_unrefreshed),
             )
         return result
+
+
+def _basis_holds(
+    store:     DataStore,
+    reg:       SourceRegistration,
+    symbol:    str,
+    asset_id:  str,
+    data_type: DataType,
+) -> bool | None:
+    """Whether the cached series is on the source's price basis; None when that can't be checked.
+
+    A split rescales a source's earlier bars, so appending to a moved series splices two bases
+    (2:1 reads as -50%). The newest bar catches a split since the last fetch; the oldest also
+    catches one applied to history only after post-split bars were served and appended.
+    """
+    cached = store.load(asset_id, data_type, reg.provider)
+    if cached is None or cached.empty:
+        return True
+    newest, oldest = cached.index.max(), cached.index.min()
+    holds = _bar_matches(reg, symbol, asset_id, data_type, cached, newest)
+    if holds is not True or oldest == newest:
+        return holds
+    return _bar_matches(reg, symbol, asset_id, data_type, cached, oldest, is_oldest=True)
+
+
+def _bar_matches(
+    reg:       SourceRegistration,
+    symbol:    str,
+    asset_id:  str,
+    data_type: DataType,
+    cached:    pd.DataFrame,
+    label:     pd.Timestamp,
+    is_oldest: bool = False,
+) -> bool | None:
+    """Whether the source still reports the cached close at `label`; None when it can't say.
+
+    The oldest bar's probe also reads a window after it. Data in the window but not the bar
+    means the source dropped it (mismatched: refetch); an empty window may be an outage, and
+    refetching then would cut the cached history, so that stays unverifiable.
+    """
+    start = label - reg.interval
+    try:
+        probe = reg.adapter.fetch(
+            symbol, start, start + (_OLDEST_PROBE_WINDOW if is_oldest else pd.Timedelta(0)))
+        if is_oldest and not probe.empty and label not in probe.index:
+            log.warning("%s [%s.%s] source no longer has the cached bar at %s: refetching",
+                        asset_id, reg.provider, data_type, label)
+            return False
+        old, new = float(cached.loc[label, "close"]), float(probe.loc[label, "close"])
+    except Exception as exc:
+        log.warning("%s [%s.%s] basis probe at %s failed: %s",
+                    asset_id, reg.provider, data_type, label, exc)
+        return None
+    if math.isnan(old) or math.isnan(new):  # not "rebased": that would refetch on every call
+        log.warning("%s [%s.%s] basis probe at %s has a NaN close",
+                    asset_id, reg.provider, data_type, label)
+        return None
+    if math.isclose(old, new, rel_tol=_REBASE_RTOL):
+        return True
+    log.warning("%s [%s.%s] rebased at source (close %s -> %s at %s): refetching the series",
+                asset_id, reg.provider, data_type, old, new, label)
+    return False
+
+
+class _Staged:
+    """The store as `_fill_gaps` sees it during a refetch: it writes here, not to the cache."""
+
+    def __init__(self) -> None:
+        self.records: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+        self.saved: pd.DataFrame | None = None
+
+    def load(self, *_) -> None:
+        return None
+
+    def record_fetched(self, _asset_id, _data_type, _provider, start, end) -> None:
+        self.records.append((start, end))
+
+    def save(self, _asset_id, _data_type, _provider, df) -> None:
+        self.saved = df
+
+
+def _replace_series(
+    store:    DataStore,
+    reg:      SourceRegistration,
+    symbol:   str,
+    asset_id: str,
+    start:    pd.Timestamp,
+    end:      pd.Timestamp,
+) -> bool:
+    """Refetch [start, end] whole and swap it in for the cached series, once data has come back.
+
+    Forgetting first let an outage's empty answer wipe the series, and the next fetch recorded
+    the window as pre-listing for good. Only the coverage goes before the save; the file stays
+    until `save` replaces it, and the windows are recorded last, so a crash leaves a series.
+    """
+    staged = _Staged()
+    refreshed = _fill_gaps(staged, reg, symbol, asset_id, [(start, end)])
+    if staged.saved is None:
+        return False  # nothing to replace it with: the old cache stays, flagged by the caller
+    try:
+        store.forget(asset_id, reg.data_type, reg.provider, keep_file=True)
+    except Exception as exc:
+        log.warning("%s [%s.%s] could not drop the rebased series: %s",
+                    asset_id, reg.provider, reg.data_type, exc)
+        return False
+    store.save(asset_id, reg.data_type, reg.provider, staged.saved)
+    for window_start, window_end in staged.records:
+        store.record_fetched(asset_id, reg.data_type, reg.provider, window_start, window_end)
+    return refreshed
 
 
 def _has_data_before(
@@ -159,7 +289,7 @@ def _fill_gaps(
     """
     cached           = store.load(asset_id, reg.data_type, reg.provider)
     new_chunks: list[pd.DataFrame] = []
-    complete_through = pd.Timestamp.now(tz="UTC").floor(reg.interval)
+    complete_through = (_now() - reg.lag).floor(reg.interval)
     refreshed        = True
 
     for gs, ge in gaps:

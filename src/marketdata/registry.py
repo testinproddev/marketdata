@@ -26,6 +26,12 @@ class SourceRegistration:
     # everywhere today; a future sub-hourly source must set this explicitly or
     # _fill_gaps's "is this bar closed yet" check silently uses the wrong unit.
     interval:   pd.Timedelta = pd.Timedelta(hours=1)
+    # How far behind real time the source's newest data runs (Alpaca's free SIP plan: 16 min).
+    # A bar is not "closed" for the fetcher until it is closed for the source too.
+    lag:        pd.Timedelta = pd.Timedelta(0)
+    # The source rescales history after the fact (a split): fetcher._basis_holds checks the
+    # cached series before extending it.
+    rebases:    bool = False
 
 
 @dataclass

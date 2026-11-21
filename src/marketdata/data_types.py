@@ -14,6 +14,7 @@ class DataProvider(StrEnum):
     COINGECKO       = "coingecko"
     HYPERLIQUID     = "hyperliquid"        # HL's own first perp dex
     YFINANCE        = "yfinance"
+    ALPACA          = "alpaca"             # US-equity tape (SIP), hourly regular session
     # HIP-3 builder-deployed perp dexes. One provider per dex, never a shared
     # "hip3": the cache keys on (asset_id, data_type, provider) and an
     # underlying listed on two dexes resolves to one asset_id, so a shared
